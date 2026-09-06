@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"konsulin-service/internal/app/contracts"
@@ -32,51 +33,6 @@ const (
 	supertokenAccessTokenPayloadFhirResourceId = "fhirResourceId"
 )
 
-// getFhirResourceIdForUser determines the FHIR resource ID based on user's roles and existing FHIR resources.
-// It performs a read-only lookup of existing FHIR resources by SuperTokenUserID.
-// Priority: Practitioner > Patient > Person
-func (uc *authUsecase) getFhirResourceIdForUser(ctx context.Context, userID string, roles []string) (string, error) {
-	// Lookup existing FHIR resources by SuperTokenUserID
-	lookupInput := &contracts.LookupUserFHIRResourceIDsInput{
-		SuperTokenUserID: userID,
-	}
-
-	lookupCtx, lookupCtxCancel := context.WithDeadline(ctx, time.Now().Add(10*time.Second))
-	defer lookupCtxCancel()
-
-	lookedUpResources, err := uc.UserUsecase.LookupUserFHIRResourceIDs(lookupCtx, lookupInput)
-	if err != nil {
-		uc.Log.Error("authUsecase.getFhirResourceIdForUser error looking up FHIR resources",
-			zap.String("user_id", userID),
-			zap.Error(err),
-		)
-		return "", err
-	}
-
-	// Determine FHIR resource ID based on role priority:
-	// 1. If Practitioner role exists → Practitioner/{ID}
-	// 2. Else if Patient role exists → Patient/{ID}
-	// 3. Otherwise → Person/{ID}
-	for _, role := range roles {
-		if role == constvars.KonsulinRolePractitioner && lookedUpResources.PractitionerID != "" {
-			return fmt.Sprintf("Practitioner/%s", lookedUpResources.PractitionerID), nil
-		}
-	}
-
-	for _, role := range roles {
-		if role == constvars.KonsulinRolePatient && lookedUpResources.PatientID != "" {
-			return fmt.Sprintf("Patient/%s", lookedUpResources.PatientID), nil
-		}
-	}
-
-	if lookedUpResources.PersonID != "" {
-		return fmt.Sprintf("Person/%s", lookedUpResources.PersonID), nil
-	}
-
-	return "", errors.New("no FHIR resource ID found for user")
-}
-
-// InitializeSupertoken configures SuperTokens recipes and verifies required roles.
 func (uc *authUsecase) InitializeSupertoken() error {
 	apiBasePath := fmt.Sprintf("%s/%s%s", uc.InternalConfig.App.EndpointPrefix, uc.InternalConfig.App.Version, uc.DriverConfig.Supertoken.ApiBasePath)
 	websiteBasePath := uc.DriverConfig.Supertoken.WebsiteBasePath
@@ -102,70 +58,108 @@ func (uc *authUsecase) InitializeSupertoken() error {
 	}
 
 	supertokenRecipeList := []supertokens.Recipe{
-		passwordless.Init(plessmodels.TypeInput{
-			Override: &plessmodels.OverrideStruct{
-				Functions: func(originalImplementation plessmodels.RecipeInterface) plessmodels.RecipeInterface {
-					// Override CreateCode
-					originalCreateCode := *originalImplementation.CreateCode
-					(*originalImplementation.CreateCode) = uc.supertokenCreateCode(originalCreateCode)
-
-					// Override ConsumeCode
-					originalConsumeCode := *originalImplementation.ConsumeCode
-					(*originalImplementation.ConsumeCode) = uc.supertokenConsumeCode(originalConsumeCode)
-
-					return originalImplementation
-				},
-				APIs: func(originalImplementation plessmodels.APIInterface) plessmodels.APIInterface {
-					// Disable SuperTokens' built-in email existence endpoint so our chi handler can take over.
-					originalImplementation.EmailExistsGET = nil
-					return originalImplementation
-				},
-			},
-			EmailDelivery: &emaildelivery.TypeInput{
-				Override: uc.supertokenEmailDeliveryOverride(),
-			},
-			SmsDelivery: &smsdelivery.TypeInput{
-				Override: uc.supertokenSmsDeliveryOverride(),
-			},
-			FlowType: "MAGIC_LINK",
-			ContactMethodEmailOrPhone: plessmodels.ContactMethodEmailOrPhoneConfig{
-				Enabled:             true,
-				ValidateEmailAddress: validateEmailAddress,
-				ValidatePhoneNumber:  validatePhoneNumber,
-			},
-		}),
+		passwordless.Init(uc.buildPasswordlessConfig()),
 		userroles.Init(nil),
-		session.Init(&sessmodels.TypeInput{
-			Override: &sessmodels.OverrideStruct{
-				Functions: func(originalImplementation sessmodels.RecipeInterface) sessmodels.RecipeInterface {
-					originalCreateNewSession := *originalImplementation.CreateNewSession
-					(*originalImplementation.CreateNewSession) = uc.supertokenCreateNewSession(originalCreateNewSession)
-					return originalImplementation
-				},
-			},
-			CookieSameSite: &cookieSameSite,
-			CookieSecure:   &cookieSecure,
-		}),
-		dashboard.Init(&dashboardmodels.TypeInput{
-			Admins: &[]string{
-				uc.InternalConfig.Supertoken.KonsulinDasboardAdminEmail,
-			},
-		}),
+		session.Init(uc.buildSessionConfig(&cookieSameSite, &cookieSecure)),
+		dashboard.Init(uc.buildDashboardConfig()),
 	}
 
 	err := supertokens.Init(supertokens.TypeInput{
-		OnSuperTokensAPIError: func(err error, req *http.Request, res http.ResponseWriter) {
-			log.Println(err.Error())
-		},
-		Supertokens: supertokenConnectionInfo,
-		AppInfo:     supertokenAppInfo,
-		RecipeList:  supertokenRecipeList,
+		OnSuperTokensAPIError: handleSupertokensAPIError,
+		Supertokens:           supertokenConnectionInfo,
+		AppInfo:               supertokenAppInfo,
+		RecipeList:            supertokenRecipeList,
 	})
 	if err != nil {
 		return err
 	}
 
-	roles := []string{
+	if err := initializeRoles(); err != nil {
+		return err
+	}
+
+	log.Println("Successfully initialized supertokens SDK")
+	return nil
+}
+
+// handleSupertokensAPIError is the OnSuperTokensAPIError callback. It logs the
+// full error for observability and writes a real 500 JSON response in
+// SuperTokens' GeneralErrorResponse shape, so recipe API failures never surface
+// as Go's implicit 200 with an empty body (which breaks the frontend SDK's
+// response.json() call). The message is generic on purpose: internal error
+// strings stay in the backend logs.
+func handleSupertokensAPIError(err error, _ *http.Request, res http.ResponseWriter) {
+	if err != nil {
+		log.Println(err.Error())
+	}
+
+	res.Header().Set(constvars.HeaderContentType, constvars.MIMEApplicationJSON)
+	res.WriteHeader(http.StatusInternalServerError)
+	_ = json.NewEncoder(res).Encode(map[string]string{
+		"message": "Something went wrong. Please try again.",
+	})
+}
+
+// buildPasswordlessConfig builds the full passwordless recipe configuration.
+func (uc *authUsecase) buildPasswordlessConfig() plessmodels.TypeInput {
+	return plessmodels.TypeInput{
+		Override: &plessmodels.OverrideStruct{
+			Functions: func(originalImplementation plessmodels.RecipeInterface) plessmodels.RecipeInterface {
+				originalCreateCode := *originalImplementation.CreateCode
+				(*originalImplementation.CreateCode) = uc.buildPasswordlessCreateCodeOverride(originalCreateCode)
+
+				originalConsumeCode := *originalImplementation.ConsumeCode
+				(*originalImplementation.ConsumeCode) = uc.buildPasswordlessConsumeCodeOverride(originalConsumeCode)
+				return originalImplementation
+			},
+			APIs: func(originalImplementation plessmodels.APIInterface) plessmodels.APIInterface {
+				originalImplementation.EmailExistsGET = nil
+				return originalImplementation
+			},
+		},
+		EmailDelivery: uc.buildEmailDeliveryConfig(),
+		SmsDelivery:   uc.buildSMSDeliveryConfig(),
+		FlowType:      "MAGIC_LINK",
+		ContactMethodEmailOrPhone: plessmodels.ContactMethodEmailOrPhoneConfig{
+			Enabled: true,
+			ValidateEmailAddress: func(email interface{}, _ string) *string {
+				emailStr, ok := email.(string)
+				if !ok {
+					msg := "invalid email format"
+					return &msg
+				}
+
+				matched, err := regexp.MatchString(constvars.RegexEmail, emailStr)
+				if err != nil || !matched {
+					msg := "invalid email address"
+					return &msg
+				}
+
+				return nil
+			},
+			ValidatePhoneNumber: func(phoneNumber interface{}, _ string) *string {
+				phoneStr, ok := phoneNumber.(string)
+				if !ok {
+					msg := "invalid phone format"
+					return &msg
+				}
+				phoneDigits := utils.NormalizePhoneDigits(phoneStr)
+				if err := utils.ValidateInternationalPhoneDigits(phoneDigits); err != nil {
+					msg := err.Error()
+					return &msg
+				}
+
+				return nil
+			},
+		},
+	}
+}
+
+// initializeRoles creates SuperTokens roles if they do not already exist.
+// A creation failure aborts startup: running without the expected roles would
+// silently strip authorization from every session created afterwards.
+func initializeRoles() error {
+	roleNames := []string{
 		constvars.KonsulinRolePatient,
 		constvars.KonsulinRoleGuest,
 		constvars.KonsulinRoleClinicAdmin,
@@ -173,13 +167,11 @@ func (uc *authUsecase) InitializeSupertoken() error {
 		constvars.KonsulinRoleResearcher,
 		constvars.KonsulinRoleSuperadmin,
 	}
-	for _, role := range roles {
-		if err := ensureRoleExists(role); err != nil {
-			return fmt.Errorf("ensure supertokens role %q exists: %w", role, err)
+	for _, name := range roleNames {
+		if err := ensureRoleExists(name); err != nil {
+			return fmt.Errorf("ensure supertokens role %q exists: %w", name, err)
 		}
 	}
-
-	log.Println("Successfully initialized supertokens SDK")
 	return nil
 }
 
@@ -196,8 +188,63 @@ func ensureRoleExists(role string) error {
 	return nil
 }
 
-// supertokenCreateCode wraps code creation to normalize phone input and initialize FHIR resources.
-func (uc *authUsecase) supertokenCreateCode(originalCreateCode func(*string, *string, *string, string, supertokens.UserContext) (plessmodels.CreateCodeResponse, error)) func(*string, *string, *string, string, supertokens.UserContext) (plessmodels.CreateCodeResponse, error) {
+// lookupUserForCreateCode resolves user details and roles during the create-code flow.
+func (uc *authUsecase) lookupUserForCreateCode(email *string, phoneNumber *string, normalizedPhoneNumber string) (userEmail, userPhoneNumber, userID string, userRoles []string, err error) {
+	userRecord := &plessmodels.User{}
+
+	if email != nil {
+		userEmail = *email
+
+		userRecord, err = passwordless.GetUserByEmail(uc.InternalConfig.Supertoken.KonsulinTenantID, userEmail)
+		if err != nil {
+			uc.Log.Error("authUsecase.SupertokenCreateCode failed to fetch user by email",
+				zap.String("email", userEmail),
+				zap.Error(err),
+			)
+			return
+		}
+	} else if phoneNumber != nil {
+		userPhoneNumber = normalizedPhoneNumber
+
+		userRecord, err = passwordless.GetUserByPhoneNumber(uc.InternalConfig.Supertoken.KonsulinTenantID, userPhoneNumber)
+		if err != nil {
+			uc.Log.Error("authUsecase.SupertokenCreateCode failed to fetch user by phone number",
+				zap.String("phone_number", userPhoneNumber),
+				zap.Error(err),
+			)
+			return
+		}
+	} else {
+		err = errors.New("either email or phone number is required")
+		return
+	}
+
+	userRoles = []string{constvars.KonsulinRolePatient}
+	userID = ""
+
+	if userRecord != nil {
+		userID = userRecord.ID
+		userRolesResp, rErr := userroles.GetRolesForUser(uc.InternalConfig.Supertoken.KonsulinTenantID, userRecord.ID)
+		if rErr != nil {
+			uc.Log.Error("authUsecase.SupertokenCreateCode failed to fetch user roles by user ID",
+				zap.String("user_id", userRecord.ID),
+				zap.Error(rErr),
+			)
+			err = rErr
+			return
+		}
+
+		if userRolesResp.OK != nil {
+			userRoles = append(userRoles, userRolesResp.OK.Roles...)
+		}
+	}
+
+	return
+}
+
+// buildPasswordlessCreateCodeOverride returns a CreateCode override that handles
+// phone normalization, user lookup, role fetching, and FHIR resource initialization.
+func (uc *authUsecase) buildPasswordlessCreateCodeOverride(originalCreateCode func(email *string, phoneNumber *string, userInputCode *string, tenantId string, userContext supertokens.UserContext) (plessmodels.CreateCodeResponse, error)) func(email *string, phoneNumber *string, userInputCode *string, tenantId string, userContext supertokens.UserContext) (plessmodels.CreateCodeResponse, error) {
 	return func(email *string, phoneNumber *string, userInputCode *string, tenantId string, userContext supertokens.UserContext) (plessmodels.CreateCodeResponse, error) {
 		var userPhoneNumberPtr *string
 		normalizedPhoneNumber := ""
@@ -214,93 +261,355 @@ func (uc *authUsecase) supertokenCreateCode(originalCreateCode func(*string, *st
 			return response, err
 		}
 
-		userEmail := ""
-		userPhoneNumber := ""
-		userRecord := &plessmodels.User{}
-
-		if email != nil {
-			userEmail = *email
-
-			userRecord, err = passwordless.GetUserByEmail(uc.InternalConfig.Supertoken.KonsulinTenantID, userEmail)
-			if err != nil {
-				uc.Log.Error("authUsecase.SupertokenCreateCode failed to fetch user by email",
-					zap.String("email", userEmail),
-					zap.Error(err),
-				)
-				return response, err
-			}
-		} else if phoneNumber != nil {
-			userPhoneNumber = normalizedPhoneNumber
-
-			userRecord, err = passwordless.GetUserByPhoneNumber(uc.InternalConfig.Supertoken.KonsulinTenantID, userPhoneNumber)
-			if err != nil {
-				uc.Log.Error("authUsecase.SupertokenCreateCode failed to fetch user by phone number",
-					zap.String("phone_number", userPhoneNumber),
-					zap.Error(err),
-				)
-				return response, err
-			}
-		} else {
-			return response, errors.New("either email or phone number is required")
-		}
-
-		// by default, always assumes the user roles is Patient
-		// because if the user is the first time user, supertokens is not yet assigns any roles to the user.
-		// We're also assumes the registered user is always have a Patient role.
-		userRoles := []string{
-			constvars.KonsulinRolePatient,
-		}
-		userID := ""
-
-		if userRecord != nil {
-			userID = userRecord.ID
-			userRolesResp, err := userroles.GetRolesForUser(uc.InternalConfig.Supertoken.KonsulinTenantID, userRecord.ID)
-			if err != nil {
-				uc.Log.Error("authUsecase.SupertokenCreateCode failed to fetch user roles by user ID",
-					zap.String("user_id", userRecord.ID),
-					zap.Error(err),
-				)
-				return response, err
-			}
-
-			if userRolesResp.OK != nil && len(userRolesResp.OK.Roles) > 0 {
-				// Override the default Patient role with the user's roles from SuperTokens.
-				userRoles = userRolesResp.OK.Roles
-			}
-		}
-
-		initFHIRResourcesInput := &contracts.InitializeNewUserFHIRResourcesInput{
-			Email:            userEmail,
-			Phone:            userPhoneNumber,
-			SuperTokenUserID: userID,
-		}
-		initFHIRResourcesInput.ToogleByRoles(userRoles)
-
-		initializeResourceCtx, initializeResourceCtxCancel := context.WithDeadline(context.Background(), time.Now().Add(10*time.Second))
-
-		defer initializeResourceCtxCancel()
-
-		initializedResources, err := uc.UserUsecase.InitializeNewUserFHIRResources(initializeResourceCtx, initFHIRResourcesInput)
+		userEmail, userPhoneNumber, userID, userRoles, err := uc.lookupUserForCreateCode(email, phoneNumber, normalizedPhoneNumber)
 		if err != nil {
-			uc.Log.Error("authUsecase.SupertokenCreateCode error initializing new user FHIR resources",
-				zap.Error(err),
-			)
 			return response, err
 		}
 
-		uc.Log.Info("authUsecase.SupertokenCreateCode fetched user by email",
-			zap.String("email", userEmail),
-			zap.String("initialized_resources_patient_id", initializedResources.PatientID),
-			zap.String("initialized_resources_practitioner_id", initializedResources.PractitionerID),
-			zap.String("initialized_resources_person_id", initializedResources.PersonID),
-		)
+		if err := uc.initializeFHIRForUser(userID, &userEmail, &userPhoneNumber, userRoles); err != nil {
+			return response, err
+		}
 
 		return response, nil
 	}
 }
 
-// supertokenConsumeCode wraps code consumption to assign default roles and initialize FHIR resources.
-func (uc *authUsecase) supertokenConsumeCode(originalConsumeCode func(*plessmodels.UserInputCodeWithDeviceID, *string, string, string, supertokens.UserContext) (plessmodels.ConsumeCodeResponse, error)) func(*plessmodels.UserInputCodeWithDeviceID, *string, string, string, supertokens.UserContext) (plessmodels.ConsumeCodeResponse, error) {
+// resolveRolesForConsumeCode fetches user roles, adding the Patient role if none exist.
+func (uc *authUsecase) resolveRolesForConsumeCode(userID string) ([]string, error) {
+	rolesResp, err := userroles.GetRolesForUser(uc.InternalConfig.Supertoken.KonsulinTenantID, userID)
+	if err != nil {
+		uc.Log.Error("authUsecase.SupertokenConsumeCode supertokens error get roles for user by tenantID & UserID",
+			zap.Error(err),
+		)
+		return nil, err
+	}
+
+	if rolesResp.OK == nil {
+		uc.Log.Error("authUsecase.SupertokenConsumeCode supertokens error get roles for user by tenantID & UserID is nil",
+			zap.String("user_id", userID),
+		)
+		return nil, errors.New("unexpected nil response when getting roles for user")
+	}
+
+	userRoles := rolesResp.OK.Roles
+
+	if len(userRoles) == 0 {
+		roleResp, err := userroles.AddRoleToUser(
+			uc.InternalConfig.Supertoken.KonsulinTenantID,
+			userID,
+			constvars.KonsulinRolePatient,
+			nil,
+		)
+		if err != nil {
+			uc.Log.Error("authUsecase.SupertokenConsumeCode error adding role to user",
+				zap.Error(err),
+				zap.String("user_id", userID),
+			)
+			return nil, err
+		}
+
+		if roleResp.OK == nil {
+			uc.Log.Error(
+				"unexpected nil response when initializing user roles after consume code",
+				zap.String("user_id", userID),
+			)
+			return nil, errors.New("unexpected nil response when initializing user roles after consume code")
+		}
+
+		newUserRolesResp, err := userroles.GetRolesForUser(uc.InternalConfig.Supertoken.KonsulinTenantID, userID)
+		if err != nil {
+			uc.Log.Error("authUsecase.SupertokenConsumeCode error getting roles for user",
+				zap.Error(err),
+				zap.String("user_id", userID),
+			)
+			return nil, err
+		}
+
+		if newUserRolesResp.OK == nil {
+			uc.Log.Error("authUsecase.SupertokenConsumeCode unexpected nil response when getting roles for user",
+				zap.String("user_id", userID),
+			)
+			return nil, errors.New("unexpected nil response when getting roles for user")
+		}
+
+		userRoles = newUserRolesResp.OK.Roles
+	}
+
+	return userRoles, nil
+}
+
+// initializeFHIRForUser initializes FHIR resources (Patient/Practitioner/Person) for a user.
+func (uc *authUsecase) initializeFHIRForUser(userID string, email *string, phoneNumber *string, userRoles []string) error {
+	userEmail := ""
+	userPhoneNumber := ""
+
+	if email != nil {
+		userEmail = *email
+	}
+	if phoneNumber != nil {
+		userPhoneNumber = *phoneNumber
+	}
+
+	initInput := &contracts.InitializeNewUserFHIRResourcesInput{
+		Email:            userEmail,
+		Phone:            userPhoneNumber,
+		SuperTokenUserID: userID,
+	}
+	initInput.ToogleByRoles(userRoles)
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(10*time.Second))
+	defer cancel()
+
+	result, err := uc.UserFHIRInitializer.InitializeNewUserFHIRResources(ctx, initInput)
+	if err != nil {
+		uc.Log.Error("authUsecase failed to initialize FHIR resources",
+			zap.Error(err),
+			zap.String("user_id", userID),
+		)
+		return err
+	}
+
+	uc.Log.Info("authUsecase initialized FHIR resources",
+		zap.String("user_id", userID),
+		zap.String("patient_id", result.PatientID),
+		zap.String("practitioner_id", result.PractitionerID),
+		zap.Strings("practitioner_role_ids", result.PractitionerRoleIDs),
+	)
+	return nil
+}
+
+// buildPasswordlessConsumeCodeOverride returns a ConsumeCode override that handles
+// role assignment on consume and FHIR resource initialization.
+// buildEmailDeliveryConfig constructs the email delivery config for passwordless login.
+func (uc *authUsecase) buildEmailDeliveryConfig() *emaildelivery.TypeInput {
+	return &emaildelivery.TypeInput{
+		Override: func(originalImplementation emaildelivery.EmailDeliveryInterface) emaildelivery.EmailDeliveryInterface {
+			originalSendEmail := *originalImplementation.SendEmail
+			(*originalImplementation.SendEmail) = func(input emaildelivery.EmailType, userContext supertokens.UserContext) error {
+				// Only intercept passwordless magic-link emails; for anything else, fall back to default.
+				if input.PasswordlessLogin == nil {
+					return originalSendEmail(input, userContext)
+				}
+
+				if input.PasswordlessLogin.UrlWithLinkCode == nil {
+					return errors.New("passwordless email delivery: missing UrlWithLinkCode")
+				}
+
+				// NOTE: SuperTokens' email delivery interface does not provide request context.
+				// Use Background context with timeout (from InternalConfig) for now.
+				timeoutSeconds := uc.InternalConfig.Webhook.HTTPTimeoutInSeconds
+				if timeoutSeconds <= 0 {
+					timeoutSeconds = 10
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
+				defer cancel()
+
+				err := uc.MagicLinkDelivery.SendMagicLink(ctx, contracts.SendMagicLinkInput{
+					URL:   *input.PasswordlessLogin.UrlWithLinkCode,
+					Email: input.PasswordlessLogin.Email,
+				})
+				if err != nil {
+					uc.Log.Error("authUsecase.EmailDelivery.SendEmail error calling magiclink webhook",
+						zap.Error(err),
+					)
+					return err
+				}
+				return nil
+			}
+			return originalImplementation
+		},
+	}
+}
+
+// setGuestAccessTokenPayload stamps the guest role and an empty FHIR resource ID,
+// the fallback payload used whenever the user's roles cannot be resolved.
+func setGuestAccessTokenPayload(payload map[string]interface{}) {
+	payload[supertokenAccessTokenPayloadRolesKey] = map[string]interface{}{
+		supertokenAccessTokenPayloadRolesValueKey: []interface{}{constvars.KonsulinRoleGuest},
+	}
+	payload[supertokenAccessTokenPayloadFhirResourceId] = ""
+}
+
+// buildAccessTokenPayload builds the roles and FHIR resource ID payload for the
+// SuperTokens access token.
+func (uc *authUsecase) buildAccessTokenPayload(userID, tenantId string, payload map[string]interface{}) {
+	if userID == "" {
+		setGuestAccessTokenPayload(payload)
+		return
+	}
+
+	rolesResp, err := userroles.GetRolesForUser(tenantId, userID)
+	if err != nil || rolesResp.OK == nil {
+		if err != nil {
+			uc.Log.Error("authUsecase.CreateNewSession error getting roles for user",
+				zap.String("user_id", userID),
+				zap.Error(err),
+			)
+		} else {
+			uc.Log.Error("authUsecase.CreateNewSession supertokens get roles response is nil",
+				zap.String("user_id", userID),
+			)
+		}
+		setGuestAccessTokenPayload(payload)
+		return
+	}
+
+	userRoles := rolesResp.OK.Roles
+	roles := make([]interface{}, len(userRoles))
+	for i, role := range userRoles {
+		roles[i] = role
+	}
+	payload[supertokenAccessTokenPayloadRolesKey] = map[string]interface{}{
+		supertokenAccessTokenPayloadRolesValueKey: roles,
+	}
+
+	// The FHIR resource ID is best-effort: a lookup failure must not block the
+	// session, so the claim is left empty and the caller can re-resolve later.
+	fhirResourceId, fhirErr := uc.getFhirResourceIdForUser(context.Background(), userID, userRoles)
+	switch {
+	case fhirErr != nil:
+		uc.Log.Error("authUsecase.CreateNewSession error getting FHIR resource ID",
+			zap.String("user_id", userID),
+			zap.Error(fhirErr),
+		)
+		payload[supertokenAccessTokenPayloadFhirResourceId] = ""
+	case fhirResourceId != "":
+		payload[supertokenAccessTokenPayloadFhirResourceId] = fhirResourceId
+		uc.Log.Info("authUsecase.CreateNewSession added FHIR resource ID to access token",
+			zap.String("user_id", userID),
+			zap.String("fhir_resource_id", fhirResourceId),
+		)
+	default:
+		payload[supertokenAccessTokenPayloadFhirResourceId] = ""
+	}
+}
+
+// getFhirResourceIdForUser determines the FHIR resource ID based on the user's roles
+// and existing FHIR resources. It performs a read-only lookup by SuperTokenUserID and
+// never creates anything.
+//
+// Priority: a practitioner-backed role (Practitioner, Clinic Admin, Researcher) resolves
+// to Practitioner/{ID}, then the Patient role to Patient/{ID}, then whichever resource
+// the lookup happened to find. Superadmin has no FHIR resource by design.
+func (uc *authUsecase) getFhirResourceIdForUser(ctx context.Context, userID string, roles []string) (string, error) {
+	lookupInput := &contracts.LookupUserFHIRResourceIDsInput{
+		SuperTokenUserID: userID,
+	}
+
+	lookupCtx, lookupCtxCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer lookupCtxCancel()
+
+	lookedUpResources, err := uc.UserFHIRInitializer.LookupUserFHIRResourceIDs(lookupCtx, lookupInput)
+	if err != nil {
+		uc.Log.Error("authUsecase.getFhirResourceIdForUser error looking up FHIR resources",
+			zap.String("user_id", userID),
+			zap.Error(err),
+		)
+		return "", err
+	}
+
+	for _, role := range roles {
+		switch role {
+		case constvars.KonsulinRolePractitioner, constvars.KonsulinRoleClinicAdmin, constvars.KonsulinRoleResearcher:
+			if lookedUpResources.PractitionerID != "" {
+				return fmt.Sprintf("Practitioner/%s", lookedUpResources.PractitionerID), nil
+			}
+		}
+	}
+
+	for _, role := range roles {
+		if role == constvars.KonsulinRolePatient && lookedUpResources.PatientID != "" {
+			return fmt.Sprintf("Patient/%s", lookedUpResources.PatientID), nil
+		}
+	}
+
+	if lookedUpResources.PractitionerID != "" {
+		return fmt.Sprintf("Practitioner/%s", lookedUpResources.PractitionerID), nil
+	}
+	if lookedUpResources.PatientID != "" {
+		return fmt.Sprintf("Patient/%s", lookedUpResources.PatientID), nil
+	}
+
+	return "", errors.New("no FHIR resource ID found for user")
+}
+
+// buildSessionConfig constructs the session recipe configuration.
+func (uc *authUsecase) buildSessionConfig(cookieSameSite *string, cookieSecure *bool) *sessmodels.TypeInput {
+	return &sessmodels.TypeInput{
+		Override: &sessmodels.OverrideStruct{
+			Functions: func(originalImplementation sessmodels.RecipeInterface) sessmodels.RecipeInterface {
+				originalCreateNewSession := *originalImplementation.CreateNewSession
+
+				(*originalImplementation.CreateNewSession) = func(userID string, accessTokenPayload, sessionDataInDatabase map[string]interface{}, disableAntiCsrf *bool, tenantId string, userContext supertokens.UserContext) (sessmodels.SessionContainer, error) {
+					if accessTokenPayload == nil {
+						accessTokenPayload = make(map[string]interface{})
+					}
+					uc.buildAccessTokenPayload(userID, tenantId, accessTokenPayload)
+					return originalCreateNewSession(userID, accessTokenPayload, sessionDataInDatabase, disableAntiCsrf, tenantId, userContext)
+				}
+
+				return originalImplementation
+			},
+		},
+		CookieSameSite: cookieSameSite,
+		CookieSecure:   cookieSecure,
+	}
+}
+
+// buildDashboardConfig constructs the dashboard recipe config.
+func (uc *authUsecase) buildDashboardConfig() *dashboardmodels.TypeInput {
+	return &dashboardmodels.TypeInput{
+		Admins: &[]string{
+			uc.InternalConfig.Supertoken.KonsulinDasboardAdminEmail,
+		},
+	}
+}
+
+// sendSMSViaWebhook sends a magic link via the SMS webhook, with phone validation.
+func (uc *authUsecase) sendSMSViaWebhook(input smsdelivery.PasswordlessLoginType) error {
+	if input.UrlWithLinkCode == nil {
+		return errors.New("passwordless sms delivery: missing UrlWithLinkCode")
+	}
+	phoneDigits := strings.TrimSpace(input.PhoneNumber)
+	if phoneDigits == "" {
+		return errors.New("passwordless sms delivery: missing PhoneNumber")
+	}
+	phoneDigitsNormalized := utils.NormalizePhoneDigits(phoneDigits)
+	if err := utils.ValidateInternationalPhoneDigits(phoneDigitsNormalized); err != nil {
+		return err
+	}
+	timeoutSeconds := uc.InternalConfig.Webhook.HTTPTimeoutInSeconds
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 10
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
+	defer cancel()
+	return uc.MagicLinkDelivery.SendMagicLink(ctx, contracts.SendMagicLinkInput{
+		URL:   *input.UrlWithLinkCode,
+		Phone: phoneDigitsNormalized,
+	})
+}
+
+// buildSMSDeliveryConfig constructs the SMS delivery config for passwordless login.
+func (uc *authUsecase) buildSMSDeliveryConfig() *smsdelivery.TypeInput {
+	return &smsdelivery.TypeInput{
+		Override: func(originalImplementation smsdelivery.SmsDeliveryInterface) smsdelivery.SmsDeliveryInterface {
+			(*originalImplementation.SendSms) = func(input smsdelivery.SmsType, _ supertokens.UserContext) error {
+				if input.PasswordlessLogin == nil {
+					return errors.New("passwordless sms delivery: missing PasswordlessLogin payload")
+				}
+				if err := uc.sendSMSViaWebhook(*input.PasswordlessLogin); err != nil {
+					uc.Log.Error("authUsecase.SmsDelivery.SendSms error calling magiclink webhook", zap.Error(err))
+					return err
+				}
+				return nil
+			}
+			return originalImplementation
+		},
+	}
+}
+
+func (uc *authUsecase) buildPasswordlessConsumeCodeOverride(originalConsumeCode func(userInput *plessmodels.UserInputCodeWithDeviceID, linkCode *string, preAuthSessionID string, tenantId string, userContext supertokens.UserContext) (plessmodels.ConsumeCodeResponse, error)) func(userInput *plessmodels.UserInputCodeWithDeviceID, linkCode *string, preAuthSessionID string, tenantId string, userContext supertokens.UserContext) (plessmodels.ConsumeCodeResponse, error) {
 	return func(userInput *plessmodels.UserInputCodeWithDeviceID, linkCode *string, preAuthSessionID string, tenantId string, userContext supertokens.UserContext) (plessmodels.ConsumeCodeResponse, error) {
 		response, err := originalConsumeCode(userInput, linkCode, preAuthSessionID, tenantId, userContext)
 		if err != nil {
@@ -332,278 +641,15 @@ func (uc *authUsecase) supertokenConsumeCode(originalConsumeCode func(*plessmode
 			return plessmodels.ConsumeCodeResponse{}, errors.New("unexpected nil response when getting roles for user")
 		}
 
-		userRoles := rolesResp.OK.Roles
-
-		// if the user roles is empty, it means that the user
-		// registered using create code flow and thus no roles
-		// assigned to the user. We will assign the default role
-		// to the user.
-		if len(userRoles) == 0 {
-			roleResp, err := userroles.AddRoleToUser(
-				uc.InternalConfig.Supertoken.KonsulinTenantID,
-				user.ID,
-				constvars.KonsulinRolePatient,
-				nil,
-			)
-
-			if err != nil {
-				uc.Log.Error("authUsecase.SupertokenConsumeCode error adding role to user",
-					zap.Error(err),
-					zap.String("user_id", user.ID),
-				)
-				return plessmodels.ConsumeCodeResponse{}, err
-			}
-
-			if roleResp.OK == nil {
-				uc.Log.Error(
-					"unexpected nil response when initializing user roles after consume code",
-					zap.String("user_id", user.ID),
-				)
-				return plessmodels.ConsumeCodeResponse{}, errors.New("unexpected nil response when initializing user roles after consume code")
-			}
-
-			newUserRolesResp, err := userroles.GetRolesForUser(uc.InternalConfig.Supertoken.KonsulinTenantID, user.ID)
-
-			if err != nil {
-				uc.Log.Error("authUsecase.SupertokenConsumeCode error getting roles for user",
-					zap.Error(err),
-					zap.String("user_id", user.ID),
-				)
-				return plessmodels.ConsumeCodeResponse{}, err
-			}
-
-			if newUserRolesResp.OK == nil {
-				uc.Log.Error("authUsecase.SupertokenConsumeCode unexpected nil response when getting roles for user",
-					zap.String("user_id", user.ID),
-				)
-				return plessmodels.ConsumeCodeResponse{}, errors.New("unexpected nil response when getting roles for user")
-			}
-
-			userRoles = newUserRolesResp.OK.Roles
-		}
-
-		// this was made to prevent accidental access to nil values
-		// that might happen because we need to support both email and phone number based login.
-		userEmail := ""
-		userPhoneNumber := ""
-
-		if user.Email != nil {
-			userEmail = *user.Email
-		}
-
-		if user.PhoneNumber != nil {
-			userPhoneNumber = *user.PhoneNumber
-		}
-
-		initializeFHIRResourcesInput := &contracts.InitializeNewUserFHIRResourcesInput{
-			Email:            userEmail,
-			Phone:            userPhoneNumber,
-			SuperTokenUserID: user.ID,
-		}
-		initializeFHIRResourcesInput.ToogleByRoles(userRoles)
-
-		initializeResourceCtx, initializeResourceCtxCancel := context.WithDeadline(context.Background(), time.Now().Add(10*time.Second))
-		defer initializeResourceCtxCancel()
-
-		initializedResources, err := uc.UserUsecase.InitializeNewUserFHIRResources(initializeResourceCtx, initializeFHIRResourcesInput)
+		userRoles, err := uc.resolveRolesForConsumeCode(user.ID)
 		if err != nil {
-			uc.Log.Error("authUsecase.SupertokenConsumeCode error initializing new user FHIR resources",
-				zap.Error(err),
-			)
 			return plessmodels.ConsumeCodeResponse{}, err
 		}
 
-		uc.Log.Info("consumeCode: login OK",
-			zap.String("uid", user.ID),
-			zap.String("initialized_resources_patient_id", initializedResources.PatientID),
-			zap.String("initialized_resources_practitioner_id", initializedResources.PractitionerID),
-			zap.String("initialized_resources_person_id", initializedResources.PersonID),
-		)
+		if err := uc.initializeFHIRForUser(user.ID, user.Email, user.PhoneNumber, userRoles); err != nil {
+			return plessmodels.ConsumeCodeResponse{}, err
+		}
+
 		return response, nil
-	}
-}
-
-// supertokenEmailDeliveryOverride routes passwordless email magic links through MagicLinkDelivery.
-func (uc *authUsecase) supertokenEmailDeliveryOverride() func(emaildelivery.EmailDeliveryInterface) emaildelivery.EmailDeliveryInterface {
-	return func(originalImplementation emaildelivery.EmailDeliveryInterface) emaildelivery.EmailDeliveryInterface {
-		originalSendEmail := *originalImplementation.SendEmail
-		(*originalImplementation.SendEmail) = func(input emaildelivery.EmailType, userContext supertokens.UserContext) error {
-			// Only intercept passwordless magic-link emails; for anything else, fall back to default.
-			if input.PasswordlessLogin == nil {
-				return originalSendEmail(input, userContext)
-			}
-
-			if input.PasswordlessLogin.UrlWithLinkCode == nil {
-				return errors.New("passwordless email delivery: missing UrlWithLinkCode")
-			}
-
-			// NOTE: SuperTokens' email delivery interface does not provide request context.
-			// Use Background context with timeout (from InternalConfig) for now.
-			timeoutSeconds := uc.InternalConfig.Webhook.HTTPTimeoutInSeconds
-			if timeoutSeconds <= 0 {
-				timeoutSeconds = 10
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
-			defer cancel()
-
-			err := uc.MagicLinkDelivery.SendMagicLink(ctx, contracts.SendMagicLinkInput{
-				URL:   *input.PasswordlessLogin.UrlWithLinkCode,
-				Email: input.PasswordlessLogin.Email,
-			})
-			if err != nil {
-				uc.Log.Error("authUsecase.EmailDelivery.SendEmail error calling magiclink webhook",
-					zap.Error(err),
-				)
-				return err
-			}
-			return nil
-		}
-		return originalImplementation
-	}
-}
-
-// supertokenSmsDeliveryOverride routes passwordless SMS magic links through MagicLinkDelivery.
-func (uc *authUsecase) supertokenSmsDeliveryOverride() func(smsdelivery.SmsDeliveryInterface) smsdelivery.SmsDeliveryInterface {
-	return func(originalImplementation smsdelivery.SmsDeliveryInterface) smsdelivery.SmsDeliveryInterface {
-		(*originalImplementation.SendSms) = func(input smsdelivery.SmsType, _ supertokens.UserContext) error {
-			if input.PasswordlessLogin == nil {
-				return errors.New("passwordless sms delivery: missing PasswordlessLogin payload")
-			}
-			if input.PasswordlessLogin.UrlWithLinkCode == nil {
-				return errors.New("passwordless sms delivery: missing UrlWithLinkCode")
-			}
-
-			phoneDigits := strings.TrimSpace(input.PasswordlessLogin.PhoneNumber)
-			if phoneDigits == "" {
-				return errors.New("passwordless sms delivery: missing PhoneNumber")
-			}
-
-			phoneDigitsNormalized := utils.NormalizePhoneDigits(phoneDigits)
-			if err := utils.ValidateInternationalPhoneDigits(phoneDigitsNormalized); err != nil {
-				return err
-			}
-
-			timeoutSeconds := uc.InternalConfig.Webhook.HTTPTimeoutInSeconds
-			if timeoutSeconds <= 0 {
-				timeoutSeconds = 10
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
-			defer cancel()
-
-			err := uc.MagicLinkDelivery.SendMagicLink(ctx, contracts.SendMagicLinkInput{
-				URL:   *input.PasswordlessLogin.UrlWithLinkCode,
-				Phone: phoneDigitsNormalized,
-			})
-			if err != nil {
-				uc.Log.Error("authUsecase.SmsDelivery.SendSms error calling magiclink webhook",
-					zap.Error(err),
-				)
-				return err
-			}
-
-			return nil
-		}
-		return originalImplementation
-	}
-}
-
-// validateEmailAddress validates the passwordless email input expected by SuperTokens.
-func validateEmailAddress(email interface{}, _ string) *string {
-	emailStr, ok := email.(string)
-	if !ok {
-		msg := "invalid email format"
-		return &msg
-	}
-
-	matched, err := regexp.MatchString(constvars.RegexEmail, emailStr)
-	if err != nil || !matched {
-		msg := "invalid email address"
-		return &msg
-	}
-
-	return nil
-}
-
-// validatePhoneNumber validates and normalizes the passwordless phone input expected by SuperTokens.
-func validatePhoneNumber(phoneNumber interface{}, _ string) *string {
-	phoneStr, ok := phoneNumber.(string)
-	if !ok {
-		msg := "invalid phone format"
-		return &msg
-	}
-	phoneDigits := utils.NormalizePhoneDigits(phoneStr)
-	if err := utils.ValidateInternationalPhoneDigits(phoneDigits); err != nil {
-		msg := err.Error()
-		return &msg
-	}
-
-	return nil
-}
-
-// supertokenCreateNewSession wraps session creation to enrich access tokens with roles and FHIR resource IDs.
-func (uc *authUsecase) supertokenCreateNewSession(originalCreateNewSession func(string, map[string]interface{}, map[string]interface{}, *bool, string, supertokens.UserContext) (sessmodels.SessionContainer, error)) func(string, map[string]interface{}, map[string]interface{}, *bool, string, supertokens.UserContext) (sessmodels.SessionContainer, error) {
-	return func(userID string, accessTokenPayload, sessionDataInDatabase map[string]interface{}, disableAntiCsrf *bool, tenantId string, userContext supertokens.UserContext) (sessmodels.SessionContainer, error) {
-		if accessTokenPayload == nil {
-			accessTokenPayload = make(map[string]interface{})
-		}
-
-		setGuestAccessTokenPayload := func() {
-			accessTokenPayload[supertokenAccessTokenPayloadRolesKey] = map[string]interface{}{
-				supertokenAccessTokenPayloadRolesValueKey: []interface{}{constvars.KonsulinRoleGuest},
-			}
-			accessTokenPayload[supertokenAccessTokenPayloadFhirResourceId] = ""
-		}
-
-		if userID == "" {
-			setGuestAccessTokenPayload()
-			return originalCreateNewSession(userID, accessTokenPayload, sessionDataInDatabase, disableAntiCsrf, tenantId, userContext)
-		}
-
-		rolesResp, err := userroles.GetRolesForUser(tenantId, userID)
-		if err != nil || rolesResp.OK == nil {
-			if err != nil {
-				uc.Log.Error("authUsecase.CreateNewSession error getting roles for user",
-					zap.String("user_id", userID),
-					zap.Error(err),
-				)
-			} else {
-				uc.Log.Error("authUsecase.CreateNewSession supertokens get roles response is nil",
-					zap.String("user_id", userID),
-				)
-			}
-			setGuestAccessTokenPayload()
-			return originalCreateNewSession(userID, accessTokenPayload, sessionDataInDatabase, disableAntiCsrf, tenantId, userContext)
-		}
-
-		roles := make([]interface{}, len(rolesResp.OK.Roles))
-		userRoles := make([]string, len(rolesResp.OK.Roles))
-		for i, role := range rolesResp.OK.Roles {
-			roles[i] = role
-			userRoles[i] = role
-		}
-		accessTokenPayload[supertokenAccessTokenPayloadRolesKey] = map[string]interface{}{
-			supertokenAccessTokenPayloadRolesValueKey: roles,
-		}
-
-		// Get FHIR resource ID for the user based on their roles
-		ctx := context.Background()
-		fhirResourceId, fhirErr := uc.getFhirResourceIdForUser(ctx, userID, userRoles)
-		if fhirErr != nil {
-			uc.Log.Error("authUsecase.CreateNewSession error getting FHIR resource ID",
-				zap.String("user_id", userID),
-				zap.Error(fhirErr),
-			)
-			accessTokenPayload[supertokenAccessTokenPayloadFhirResourceId] = ""
-		} else if fhirResourceId != "" {
-			accessTokenPayload[supertokenAccessTokenPayloadFhirResourceId] = fhirResourceId
-			uc.Log.Info("authUsecase.CreateNewSession added FHIR resource ID to access token",
-				zap.String("user_id", userID),
-				zap.String("fhir_resource_id", fhirResourceId),
-			)
-		} else {
-			accessTokenPayload[supertokenAccessTokenPayloadFhirResourceId] = ""
-		}
-
-		return originalCreateNewSession(userID, accessTokenPayload, sessionDataInDatabase, disableAntiCsrf, tenantId, userContext)
 	}
 }

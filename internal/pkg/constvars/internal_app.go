@@ -22,6 +22,7 @@ const (
 const (
 	WHATSAPP_OTP_LENGTH = 6
 )
+
 const (
 	TIME_DIFFERENCE_JAKARTA       = 7
 	TIME_DIFFERENCE_BANGKOK       = 7
@@ -52,13 +53,13 @@ type ContextKey string
 
 const (
 	CONTEXT_REQUEST_ID_KEY           ContextKey = "request_id"
-	CONTEXT_SESSION_DATA_KEY         ContextKey = "session_data"
 	CONTEXT_IS_CLIENT_REQUEST_ID_KEY ContextKey = "is_client_request_id"
 	CONTEXT_STEPS_KEY                ContextKey = "steps"
 	CONTEXT_RAW_BODY                 ContextKey = "raw_body"
 	CONTEXT_FHIR_ROLE                ContextKey = "fhir_role"
 	CONTEXT_UID                      ContextKey = "uid"
 	CONTEXT_FHIR_RESOURCE_ID         ContextKey = "fhir_resource_id"
+	CONTEXT_API_KEY_AUTH             ContextKey = "api_key_auth"
 )
 
 const (
@@ -79,3 +80,13 @@ const (
 // This resource ID is used to reference the Konsulin organization in the FHIR resources.
 // For now, it is used in the payment service as the recipient and issuer for the payment service.
 const KonsulinOrganizationResourceID = "Konsulin"
+
+// SuperTokens access token payload keys shared across middlewares and controllers.
+const (
+	SupertokenPayloadRolesKey      = "st-role"
+	SupertokenPayloadRolesValueKey = "v"
+	SupertokenPayloadActiveRoleKey = "st-active-role"
+	// SupertokenPayloadFhirResourceIDKey carries the "ResourceType/id" of the FHIR
+	// resource backing the session's user, stamped at session creation.
+	SupertokenPayloadFhirResourceIDKey = "fhirResourceId"
+)
