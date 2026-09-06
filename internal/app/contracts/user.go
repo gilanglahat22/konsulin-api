@@ -144,6 +144,8 @@ type UserFHIRInitializer interface {
 	InitializeNewUserFHIRResources(ctx context.Context, input *InitializeNewUserFHIRResourcesInput) (*InitializeNewUserFHIRResourcesOutput, error)
 	// LookupUserFHIRResourceIDs queries existing FHIR resources by SuperTokenUserID.
 	// Unlike InitializeNewUserFHIRResources, this is read-only and will not create any resources.
+	// It returns an error if any lookup fails, rather than a partial result; a user with
+	// no matching resources yields empty IDs and a nil error.
 	LookupUserFHIRResourceIDs(ctx context.Context, input *LookupUserFHIRResourceIDsInput) (*InitializeNewUserFHIRResourcesOutput, error)
 }
 

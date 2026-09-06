@@ -107,6 +107,11 @@ func (uc *userUsecase) InitializeNewUserFHIRResources(ctx context.Context, input
 // LookupUserFHIRResourceIDs queries existing FHIR resources by SuperTokenUserID.
 // Unlike InitializeNewUserFHIRResources, this is a read-only operation that will not create any resources.
 // It looks up the Practitioner and Patient resources carrying the SuperTokenUserID identifier.
+//
+// Error contract: returns an error when the input is empty or when any lookup fails.
+// It never returns a partial result alongside an error, so callers can treat a nil
+// error as "every lookup completed". Finding no matching resources is not an error:
+// that returns an output with empty IDs and a nil error.
 func (uc *userUsecase) LookupUserFHIRResourceIDs(ctx context.Context, input *contracts.LookupUserFHIRResourceIDsInput) (*contracts.InitializeNewUserFHIRResourcesOutput, error) {
 	if input.SuperTokenUserID == "" {
 		return nil, exceptions.ErrInvalidFormat(nil, "superTokenUserID is required for lookup")
