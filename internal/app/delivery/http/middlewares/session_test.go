@@ -134,17 +134,17 @@ func runSessionCase(t *testing.T, m *Middlewares, stub *sessionStub, tc sessionC
 		t.Run(mw.name, func(t *testing.T) {
 			stub.required = nil
 			ctx := context.Background()
-			got := serveContext(t, ctx, mw.middleware)
+			got := serveContext(ctx, t, mw.middleware)
 			require.NotNil(t, stub.required)
 			require.False(t, *stub.required)
-			assertAuthContext(t, ctx, got, mw.passThrough, tc.want)
+			assertAuthContext(ctx, got, t, mw.passThrough, tc.want)
 		})
 	}
 }
 
 // serveContext runs middleware on a request carrying ctx and returns the context the
 // next handler received.
-func serveContext(t *testing.T, ctx context.Context, middleware func(http.Handler) http.Handler) context.Context {
+func serveContext(ctx context.Context, t *testing.T, middleware func(http.Handler) http.Handler) context.Context {
 	t.Helper()
 	var got context.Context
 	next := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { got = r.Context() })
@@ -153,7 +153,7 @@ func serveContext(t *testing.T, ctx context.Context, middleware func(http.Handle
 	return got
 }
 
-func assertAuthContext(t *testing.T, base, got context.Context, passThrough bool, want authContext) {
+func assertAuthContext(base, got context.Context, t *testing.T, passThrough bool, want authContext) {
 	t.Helper()
 	if passThrough {
 		require.Equal(t, base, got)
